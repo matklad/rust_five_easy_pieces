@@ -1,4 +1,3 @@
-#[macro_use]
 extern crate crossbeam_channel;
 extern crate rayon;
 
@@ -192,7 +191,6 @@ fn fourth() {
 fn fifth() {
     enum WorkMsg {
         Work(u8),
-        Exit,
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -208,14 +206,11 @@ fn fifth() {
 
     enum ResultMsg {
         Result(u8, WorkPerformed),
-        Exited,
     }
 
     let (work_sender, work_receiver) = unbounded();
     let (result_sender, result_receiver) = unbounded();
-    let (pool_result_sender, pool_result_receiver) = unbounded();
     let mut ongoing_work = 0;
-    let mut exiting = false;
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(2)
         .build()
@@ -227,158 +222,123 @@ fn fifth() {
     let cache_state: Arc<Mutex<HashMap<u8, Arc<(Mutex<CacheState>, Condvar)>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    let _ = thread::spawn(move || loop {
-        select! {
-            recv(work_receiver) -> msg => {
-                match msg {
-                    Ok(WorkMsg::Work(num)) => {
-                        let result_sender = result_sender.clone();
-                        let pool_result_sender = pool_result_sender.clone();
-                        let cache = cache.clone();
-                        let cache_state = cache_state.clone();
-                        ongoing_work += 1;
-                        pool.spawn(move || {
-                            {
+    let worker = thread::spawn(move || {
+        for WorkMsg::Work(num) in work_receiver {
+            ongoing_work += 1;
+            pool.spawn({
+                let result_sender = result_sender.clone();
+                let cache = cache.clone();
+                let cache_state = cache_state.clone();
 
-                                let (lock, cvar) = {
-                                    // Start of critical section on `cache_state`.
-                                    let mut state_map = cache_state.lock().unwrap();
-                                    &*state_map
-                                        .entry(num.clone())
-                                        .or_insert_with(|| {
-                                            Arc::new((
-                                                Mutex::new(CacheState::Ready),
-                                                Condvar::new(),
-                                            ))
-                                        })
-                                        .clone()
-                                    // End of critical section on `cache_state`.
-                                };
+                move || {
+                    {
+                        let (lock, cvar) = {
+                            // Start of critical section on `cache_state`.
+                            let mut state_map = cache_state.lock().unwrap();
+                            &*state_map
+                                .entry(num.clone())
+                                .or_insert_with(|| {
+                                    Arc::new((Mutex::new(CacheState::Ready), Condvar::new()))
+                                })
+                                .clone()
+                            // End of critical section on `cache_state`.
+                        };
 
-                                // Start of critical section on `state`.
-                                let mut state = lock.lock().unwrap();
+                        // Start of critical section on `state`.
+                        let mut state = lock.lock().unwrap();
 
-                                // Note: the `while` loop is necessary
-                                // for thd logic to be robust to spurious wake-ups.
-                                while let CacheState::WorkInProgress = *state {
-                                    // Block until the state is `CacheState::Ready`.
-                                    //
-                                    // Note: this will atomically release the lock,
-                                    // and reacquire it on wake-up.
-                                    let current_state = cvar
-                                        .wait(state)
-                                        .unwrap();
-                                    state = current_state;
-                                }
-
-                                // Here, since we're out of the loop,
-                                // we can be certain that
-                                // `state == CacheState::Ready`
-
-                                let cache = cache.lock().unwrap();
-                                if let Some(result) = cache.get(&num) {
-                                    // If we find a result in the cache,
-                                    // leave `state` as ready,
-                                    // send the result back,
-                                    // and return.
-                                    let _ = result_sender.send(ResultMsg::Result(result.clone(), WorkPerformed::FromCache));
-                                    let _ = pool_result_sender.send(());
-
-                                    // Also make sure to signal the next thread in line,
-                                    // if any, that the cache is ready to be read from.
-                                    cvar.notify_one();
-                                    return;
-                                }
-
-                                // If we didn't find a result in the cache,
-                                // switch the state to in-progress.
-                                *state = CacheState::WorkInProgress;
-
-                                // End of critical section on `state`.
-                            }
-
-                            // Do some "expensive work", outside of any critical section.
-
-                            let _ = result_sender.send(ResultMsg::Result(num.clone(), WorkPerformed::New));
-
-                            // Insert the result of the work into the cache.
-                            let mut cache = cache.lock().unwrap();
-                            cache.insert(num.clone(), num);
-
-                            // Re-enter the critical section on `cache_state`.
-                            let (lock, cvar) = {
-                                let mut state_map = cache_state.lock().unwrap();
-                                &*state_map
-                                    .get_mut(&num)
-                                    .expect("Entry in cache state to have been previously inserted")
-                                    .clone()
-                            };
-                            let mut state = lock.lock().unwrap();
-
-                            // Switch the state to ready.
-                            *state = CacheState::Ready;
-
-                            // Notify the waiting thread, if any, that the state has changed.
-                            // This can be done while still inside the critical section.
-                            cvar.notify_one();
-
-                            let _ = pool_result_sender.send(());
-                        });
-                    },
-                    Ok(WorkMsg::Exit) => {
-                        exiting = true;
-                        if ongoing_work == 0 {
-                            let _ = result_sender.send(ResultMsg::Exited);
-                            break;
+                        // Note: the `while` loop is necessary
+                        // for thd logic to be robust to spurious wake-ups.
+                        while let CacheState::WorkInProgress = *state {
+                            // Block until the state is `CacheState::Ready`.
+                            //
+                            // Note: this will atomically release the lock,
+                            // and reacquire it on wake-up.
+                            let current_state = cvar.wait(state).unwrap();
+                            state = current_state;
                         }
-                    },
-                    _ => panic!("Error receiving a WorkMsg."),
+
+                        // Here, since we're out of the loop,
+                        // we can be certain that
+                        // `state == CacheState::Ready`
+
+                        let cache = cache.lock().unwrap();
+                        if let Some(result) = cache.get(&num) {
+                            // If we find a result in the cache,
+                            // leave `state` as ready,
+                            // send the result back,
+                            // and return.
+                            result_sender
+                                .send(ResultMsg::Result(result.clone(), WorkPerformed::FromCache))
+                                .unwrap();
+
+                            // Also make sure to signal the next thread in line,
+                            // if any, that the cache is ready to be read from.
+                            cvar.notify_one();
+                            return;
+                        }
+
+                        // If we didn't find a result in the cache,
+                        // switch the state to in-progress.
+                        *state = CacheState::WorkInProgress;
+
+                        // End of critical section on `state`.
+                    }
+
+                    // Do some "expensive work", outside of any critical section.
+
+                    result_sender
+                        .send(ResultMsg::Result(num.clone(), WorkPerformed::New))
+                        .unwrap();
+
+                    // Insert the result of the work into the cache.
+                    let mut cache = cache.lock().unwrap();
+                    cache.insert(num.clone(), num);
+
+                    // Re-enter the critical section on `cache_state`.
+                    let (lock, cvar) = {
+                        let mut state_map = cache_state.lock().unwrap();
+                        &*state_map
+                            .get_mut(&num)
+                            .expect("Entry in cache state to have been previously inserted")
+                            .clone()
+                    };
+                    let mut state = lock.lock().unwrap();
+
+                    // Switch the state to ready.
+                    *state = CacheState::Ready;
+
+                    // Notify the waiting thread, if any, that the state has changed.
+                    // This can be done while still inside the critical section.
+                    cvar.notify_one();
                 }
-            },
-            recv(pool_result_receiver) -> _ => {
-                if ongoing_work == 0 {
-                    panic!("Received an unexpected pool result.");
-                }
-                ongoing_work -=1;
-                if ongoing_work == 0 && exiting {
-                    let _ = result_sender.send(ResultMsg::Exited);
-                    break;
-                }
-            },
+            });
         }
     });
 
-    let _ = work_sender.send(WorkMsg::Work(0));
-    let _ = work_sender.send(WorkMsg::Work(1));
-    let _ = work_sender.send(WorkMsg::Work(1));
-    let _ = work_sender.send(WorkMsg::Exit);
+    work_sender.send(WorkMsg::Work(0)).unwrap();
+    work_sender.send(WorkMsg::Work(1)).unwrap();
+    work_sender.send(WorkMsg::Work(1)).unwrap();
+    drop(work_sender);
 
     let mut counter = 0;
 
     // A new counter for work on 1.
     let mut work_one_counter = 0;
+    for ResultMsg::Result(num, cached) in result_receiver {
+        counter += 1;
 
-    loop {
-        match result_receiver.recv() {
-            Ok(ResultMsg::Result(num, cached)) => {
-                counter += 1;
+        if num == 1 {
+            work_one_counter += 1;
+        }
 
-                if num == 1 {
-                    work_one_counter += 1;
-                }
-
-                // Now we can assert that by the time
-                // the second result for 1 has been received,
-                // it came from the cache.
-                if num == 1 && work_one_counter == 2 {
-                    assert_eq!(cached, WorkPerformed::FromCache);
-                }
-            }
-            Ok(ResultMsg::Exited) => {
-                assert_eq!(3, counter);
-                break;
-            }
-            _ => panic!("Error receiving a ResultMsg."),
+        // Now we can assert that by the time
+        // the second result for 1 has been received,
+        // it came from the cache.
+        if num == 1 && work_one_counter == 2 {
+            assert_eq!(cached, WorkPerformed::FromCache);
         }
     }
+    assert_eq!(3, counter);
+    worker.join().unwrap();
 }
