@@ -110,7 +110,6 @@ fn second() {
 fn fourth() {
     enum WorkMsg {
         Work(u8),
-        Exit,
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -121,14 +120,11 @@ fn fourth() {
 
     enum ResultMsg {
         Result(u8, WorkPerformed),
-        Exited,
     }
 
     let (work_sender, work_receiver) = unbounded();
     let (result_sender, result_receiver) = unbounded();
-    let (pool_result_sender, pool_result_receiver) = unbounded();
     let mut ongoing_work = 0;
-    let mut exiting = false;
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(2)
         .build()
@@ -137,88 +133,59 @@ fn fourth() {
     // A cache of "work", shared by the workers on the pool.
     let cache: Arc<Mutex<HashMap<u8, u8>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    let _ = thread::spawn(move || loop {
-        select! {
-            recv(work_receiver) -> msg => {
-                match msg {
-                    Ok(WorkMsg::Work(num)) => {
-                        let result_sender = result_sender.clone();
-                        let pool_result_sender = pool_result_sender.clone();
-                        let cache = cache.clone();
-                        ongoing_work += 1;
+    let worker = thread::spawn(move || {
+        for WorkMsg::Work(num) in work_receiver {
+            ongoing_work += 1;
 
-                        pool.spawn(move || {
-                            {
-                                // Start of critical section on the cache.
-                                let cache = cache.lock().unwrap();
-                                if let Some(result) = cache.get(&num) {
-                                    // We're getting a result from the cache,
-                                    // send it back,
-                                    // along with a flag indicating we got it from the cache.
-                                    let _ = result_sender.send(ResultMsg::Result(result.clone(), WorkPerformed::FromCache));
-                                    let _ = pool_result_sender.send(());
-                                    return;
-                                }
-                                // End of critical section on the cache.
-                            }
-
-                            // Perform "expensive work" outside of the critical section.
-                            // work work work work work work...
-
-                            // Send the result back, indicating we had to perform the work.
-                            let _ = result_sender.send(ResultMsg::Result(num.clone(), WorkPerformed::New));
-
-                            // Store the result of the "expensive work" in the cache.
-                            let mut cache = cache.lock().unwrap();
-                            cache.insert(num.clone(), num);
-
-                            let _ = pool_result_sender.send(());
-                        });
-                    },
-                    Ok(WorkMsg::Exit) => {
-                        exiting = true;
-                        if ongoing_work == 0 {
-                            let _ = result_sender.send(ResultMsg::Exited);
-                            break;
+            pool.spawn({
+                let result_sender = result_sender.clone();
+                let cache = cache.clone();
+                move || {
+                    {
+                        // Start of critical section on the cache.
+                        let cache = cache.lock().unwrap();
+                        if let Some(result) = cache.get(&num) {
+                            // We're getting a result from the cache,
+                            // send it back,
+                            // along with a flag indicating we got it from the cache.
+                            result_sender
+                                .send(ResultMsg::Result(result.clone(), WorkPerformed::FromCache))
+                                .unwrap();
+                            return;
                         }
-                    },
-                    _ => panic!("Error receiving a WorkMsg."),
+                        // End of critical section on the cache.
+                    }
+
+                    // Perform "expensive work" outside of the critical section.
+                    // work work work work work work...
+
+                    // Send the result back, indicating we had to perform the work.
+                    result_sender
+                        .send(ResultMsg::Result(num.clone(), WorkPerformed::New))
+                        .unwrap();
+
+                    // Store the result of the "expensive work" in the cache.
+                    let mut cache = cache.lock().unwrap();
+                    cache.insert(num.clone(), num);
                 }
-            },
-            recv(pool_result_receiver) -> _ => {
-                if ongoing_work == 0 {
-                    panic!("Received an unexpected pool result.");
-                }
-                ongoing_work -=1;
-                if ongoing_work == 0 && exiting {
-                    let _ = result_sender.send(ResultMsg::Exited);
-                    break;
-                }
-            },
+            });
         }
     });
 
-    let _ = work_sender.send(WorkMsg::Work(0));
+    work_sender.send(WorkMsg::Work(0)).unwrap();
     // Send two requests for the same "work"
-    let _ = work_sender.send(WorkMsg::Work(1));
-    let _ = work_sender.send(WorkMsg::Work(1));
-    let _ = work_sender.send(WorkMsg::Exit);
+    work_sender.send(WorkMsg::Work(1)).unwrap();
+    work_sender.send(WorkMsg::Work(1)).unwrap();
+    drop(work_sender);
 
     let mut counter = 0;
 
-    loop {
-        match result_receiver.recv() {
-            Ok(ResultMsg::Result(_num, _cached)) => {
-                counter += 1;
-                // We cannot make assertions about `cached`.
-            }
-            Ok(ResultMsg::Exited) => {
-                assert_eq!(3, counter);
-                break;
-            }
-            _ => panic!("Error receiving a ResultMsg."),
-        }
+    for ResultMsg::Result(_num, _cached) in result_receiver {
+        counter += 1;
+        // We cannot make assertions about `cached`.
     }
+    assert_eq!(3, counter);
+    worker.join().unwrap();
 }
 
 #[test]
