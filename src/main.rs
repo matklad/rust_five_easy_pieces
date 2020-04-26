@@ -62,12 +62,10 @@ fn first() {
 fn second() {
     enum WorkMsg {
         Work(u8),
-        Exit,
     }
 
     enum ResultMsg {
         Result(u8),
-        Exited,
     }
 
     let (work_sender, work_receiver) = unbounded();
@@ -77,45 +75,35 @@ fn second() {
         .build()
         .unwrap();
 
-    let _ = thread::spawn(move || loop {
-        match work_receiver.recv() {
-            Ok(WorkMsg::Work(num)) => {
+    let worker = thread::spawn(move || {
+        for WorkMsg::Work(num) in work_receiver {
+            pool.spawn({
                 // Clone the result sender, and move the clone
                 // into the spawned worker.
                 let result_sender = result_sender.clone();
-                pool.spawn(move || {
+                move || {
                     // From a worker thread,
                     // do some "work",
                     // and send the result back.
-                    let _ = result_sender.send(ResultMsg::Result(num));
-                });
-            }
-            Ok(WorkMsg::Exit) => {
-                let _ = result_sender.send(ResultMsg::Exited);
-                break;
-            }
-            _ => panic!("Error receiving a WorkMsg."),
+                    result_sender.send(ResultMsg::Result(num)).unwrap();
+                }
+            });
         }
     });
 
-    let _ = work_sender.send(WorkMsg::Work(0));
-    let _ = work_sender.send(WorkMsg::Work(1));
-    let _ = work_sender.send(WorkMsg::Exit);
+    work_sender.send(WorkMsg::Work(0)).unwrap();
+    work_sender.send(WorkMsg::Work(1)).unwrap();
+    drop(work_sender);
 
-    loop {
-        match result_receiver.recv() {
-            Ok(ResultMsg::Result(_)) => {
-                // We cannot make assertions about ordering anymore.
-            }
-            Ok(ResultMsg::Exited) => {
-                // And neither can we make assertions
-                // that the results have been received
-                // prior to the exited message.
-                break;
-            }
-            _ => panic!("Error receiving a ResultMsg."),
-        }
+    let mut counter = 0;
+    for ResultMsg::Result(_) in result_receiver {
+        // We cannot make assertions about ordering anymore.
+        counter += 1;
     }
+    // Well actually, we can now make assertions about result!
+    assert_eq!(counter, 2);
+    worker.join().unwrap();
+    // TODO: check if rayon::ThreadPool joins threads in drop
 }
 
 #[test]
